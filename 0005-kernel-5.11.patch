@@ -1,7 +1,134 @@
-
-diff -Naur NVIDIA-Linux-x86_64-340.108-old/kernel/nv-linux.h NVIDIA-Linux-x86_64-340.108-new/kernel/nv-linux.h
---- NVIDIA-Linux-x86_64-340.108-old/kernel/nv-linux.h	2021-02-23 20:01:52.429999710 +0100
-+++ NVIDIA-Linux-x86_64-340.108-new/kernel/nv-linux.h	2021-02-23 14:48:00.163333638 +0100
+diff -Naur NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/conftest.sh NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/conftest.sh
+--- NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/conftest.sh	2021-06-27 19:40:24.049985764 +0900
++++ NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/conftest.sh	2021-06-27 21:21:21.327745755 +0900
+@@ -1586,13 +1586,9 @@
+             #error DRM not enabled
+             #endif
+             void conftest_drm_available(void) {
+-                struct drm_driver drv;
+-                drv.gem_prime_pin = 0;
+-                drv.gem_prime_get_sg_table = 0;
+-                drv.gem_prime_vmap = 0;
+-                drv.gem_prime_vunmap = 0;
+-                (void)drm_gem_prime_import;
+-                (void)drm_gem_prime_export;
++                (void)drm_dev_alloc;
++                (void)drm_dev_register;
++                (void)drm_dev_unregister;
+             }"
+ 
+             compile_check_conftest "$CODE" "NV_DRM_AVAILABLE" "" "generic"
+diff -Naur NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/nv-drm.c NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/nv-drm.c
+--- NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/nv-drm.c	2021-06-27 19:40:24.076652391 +0900
++++ NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/nv-drm.c	2021-07-03 00:24:56.835476999 +0900
+@@ -176,16 +176,32 @@
+     }
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++struct nv_drm_device {
++    struct drm_device drm;
++    struct list_head legacy_dev_list;
++};
++static struct list_head nv_dev_list;
++#endif
++
+ static int nv_drm_get_pci_dev(struct pci_dev *pdev,
+                const struct pci_device_id *ent,
+                struct drm_driver *driver)
+ {
+     struct drm_device *dev;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++    struct nv_drm_device *nv;
++#endif
+     int ret;
+ 
+     DRM_DEBUG("\n");
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++    nv = devm_drm_dev_alloc(&pdev->dev, driver, struct nv_drm_device, drm);
++    dev = &nv->drm;
++#else
+     dev = drm_dev_alloc(driver, &pdev->dev);
++#endif
+     if (IS_ERR(dev))
+         return PTR_ERR(dev);
+ 
+@@ -210,7 +226,11 @@
+     /* No locking needed since shadow-attach is single-threaded since it may
+      * only be called from the per-driver module init hook. */
+     if (drm_core_check_feature(dev, DRIVER_LEGACY))
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++        list_add_tail(&nv->legacy_dev_list, &nv_dev_list);
++#else
+         list_add_tail(&dev->legacy_dev_list, &driver->legacy_dev_list);
++#endif
+ 
+     return 0;
+ 
+@@ -239,7 +259,11 @@
+         return -EINVAL;
+ 
+     /* If not using KMS, fall back to stealth mode manual scanning. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++    INIT_LIST_HEAD(&nv_dev_list);
++#else
+     INIT_LIST_HEAD(&driver->legacy_dev_list);
++#endif
+     for (i = 0; pdriver->id_table[i].vendor != 0; i++) {
+         pid = &pdriver->id_table[i];
+ 
+@@ -266,16 +290,26 @@
+ 
+ void nv_drm_pci_exit(struct drm_driver *driver, struct pci_driver *pdriver)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++    struct nv_drm_device *nv, *tmp;
++#else
+     struct drm_device *dev, *tmp;
++#endif
+     DRM_DEBUG("\n");
+ 
+     if (!(driver->driver_features & DRIVER_LEGACY)) {
+         WARN_ON(1);
+     } else {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++        list_for_each_entry_safe(nv, tmp, &nv_dev_list, legacy_dev_list) {
++            list_del(&nv->legacy_dev_list);
++            drm_put_dev(&nv->drm);
++#else
+         list_for_each_entry_safe(dev, tmp, &driver->legacy_dev_list,
+                      legacy_dev_list) {
+             list_del(&dev->legacy_dev_list);
+             drm_put_dev(dev);
++#endif
+         }
+     }
+     DRM_INFO("Module unloaded\n");
+@@ -419,16 +453,20 @@
+ #endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
+     .gem_free_object_unlocked = nv_gem_free,
++#endif
+ #else
+     .gem_free_object = nv_gem_free,
+ #endif
+ 
+     .prime_handle_to_fd = drm_gem_prime_handle_to_fd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
+     .gem_prime_export = drm_gem_prime_export,
+     .gem_prime_get_sg_table = nv_gem_prime_get_sg_table,
+     .gem_prime_vmap = nv_gem_prime_vmap,
+     .gem_prime_vunmap = nv_gem_prime_vunmap,
++#endif
+ 
+     .name = "nvidia-drm",
+     .desc = "NVIDIA DRM driver",
+diff -Naur NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/nv-linux.h NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/nv-linux.h
+--- NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/nv-linux.h	2021-07-03 00:47:40.329407913 +0900
++++ NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/nv-linux.h	2021-07-03 00:47:19.929368477 +0900
 @@ -119,7 +119,7 @@
  #include <asm/tlbflush.h>           /* flush_tlb(), flush_tlb_all()     */
  #include <linux/cpu.h>              /* CPU hotplug support              */
@@ -11,8 +138,9 @@ diff -Naur NVIDIA-Linux-x86_64-340.108-old/kernel/nv-linux.h NVIDIA-Linux-x86_64
  
  #include <linux/pci.h>              /* pci_find_class, etc              */
  #include <linux/interrupt.h>        /* tasklets, interrupt helpers      */
---- a/kernel/uvm/nvidia_uvm_linux.h	2019-12-11 17:04:24.000000000 -0500
-+++ b/kernel/uvm/nvidia_uvm_linux.h	2021-02-24 06:26:26.237367942 -0500
+diff -Naur NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/uvm/nvidia_uvm_linux.h NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/uvm/nvidia_uvm_linux.h
+--- NVIDIA-Linux-x86_64-340.108-no-compat32-old/kernel/uvm/nvidia_uvm_linux.h	2021-07-03 00:47:40.332741253 +0900
++++ NVIDIA-Linux-x86_64-340.108-no-compat32-new/kernel/uvm/nvidia_uvm_linux.h	2021-07-03 00:47:19.932701817 +0900
 @@ -141,7 +141,7 @@
  #if !defined(NV_VMWARE)
  #include <asm/tlbflush.h>           /* flush_tlb(), flush_tlb_all()     */
@@ -22,4 +150,3 @@ diff -Naur NVIDIA-Linux-x86_64-340.108-old/kernel/nv-linux.h NVIDIA-Linux-x86_64
  
  #include <linux/interrupt.h>        /* tasklets, interrupt helpers      */
  #include <linux/timer.h>
-
